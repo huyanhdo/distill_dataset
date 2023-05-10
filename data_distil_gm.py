@@ -6,12 +6,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torchvision.utils import save_image
-from utils import get_loops, get_dataset, get_network, get_eval_pool, evaluate_synset, get_daparam, custom_match_loss, get_time, TensorDataset, custom_epoch, DiffAugment, ParamDiffAug
+from utils import get_loops, get_dataset, get_network, get_eval_pool, custom_evaluate_synset, get_daparam, custom_match_loss, get_time, TensorDataset, custom_epoch, DiffAugment, ParamDiffAug
 
-import matplotlib.pyplot as plt 
+# import matplotlib.pyplot as plt 
 
 class Distiller():
-    def __init__(self,model = 'ConvNet',method = 'DC',ipc  = 50,eval_mode = "S",num_eval=20,iteration=20000,lr_img = 1.0 ,lr_net = 0.01,batch_real = 256,batch_train = 256,init = 'real',dis_metric = 'ours'):
+    def __init__(self,model = 'ConvNet',method = 'DC',ipc  = 1,eval_mode = "S",num_eval=5,iteration=1000,lr_img = 0.1 ,lr_net = 0.01,batch_real = 256,batch_train = 256,init = 'noise',dis_metric = 'ours'):
         # self.dataset = dataset
         self.model = model
 
@@ -23,7 +23,7 @@ class Distiller():
         self.lr_net = lr_net
         self.batch_real = batch_real #batchsize for real data
         self.batch_train = batch_train #  batch training data
-        self.init = init # way to init the synth [noi   se,real]
+        self.init = init # way to init the synth 
         
         self.dis_metric = dis_metric    
 
@@ -43,7 +43,13 @@ class Distiller():
             os.mkdir(save_path)        
 
         channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test, testloader = get_dataset(dataset, data_path)
-            
+        
+        accs_all_exps = dict() # record performances of all experiments
+        for key in self.model_eval_pool:
+            accs_all_exps[key] = []
+
+        data_save = []
+
         ''' organize the real dataset '''
         images_all = []
         labels_all = []
@@ -51,31 +57,27 @@ class Distiller():
 
         images_all = [torch.unsqueeze(dst_train[i][0], dim=0) for i in range(len(dst_train))]
         labels_all = [dst_train[i][1] for i in range(len(dst_train))]
-        
-        data_save = []
-
         for i, lab in enumerate(labels_all):
             indices_class[lab].append(i)
+
         images_all = torch.cat(images_all, dim=0).to(self.device)
         labels_all = torch.tensor(labels_all, dtype=torch.long, device=self.device)
 
-        # print(images_all[0].shape)
-        plt.imshow(images_all[0].view(28,28,1).cpu())
-        plt.show()
-
-        # for c in range(num_classes):
-        #     print('class c = %d: %d real images'%(c, len(indices_class[c])))
+        for c in range(num_classes):
+            print('class c = %d: %d real images'%(c, len(indices_class[c])))
         
         def get_images(c, n): # get random n images from class c
             idx_shuffle = np.random.permutation(indices_class[c])[:n]
             return images_all[idx_shuffle]
-        # for ch in range(channel):
-        #     print('real images channel %d, mean = %.4f, std = %.4f'%(ch, torch.mean(images_all[:, ch]), torch.std(images_all[:, ch])))
+        
+        for ch in range(channel):
+            print('real images channel %d, mean = %.4f, std = %.4f'%(ch, torch.mean(images_all[:, ch]), torch.std(images_all[:, ch])))
 
 
         ''' initialize the synthetic data '''
         image_syn = torch.randn(size=(num_classes*self.ipc, channel, im_size[0], im_size[1]), dtype=torch.float, requires_grad=True, device=self.device)
-        label_syn = torch.tensor([np.ones(self.ipc)*i for i in range(num_classes)], dtype=torch.long, requires_grad=False, device=self.device).view(-1) # [0,0,0, 1,1,1, ..., 9,9,9]
+
+        label_syn = torch.tensor([np.ones(self.ipc)*i for i in range(num_classes)], requires_grad=False, device=self.device).view(-1) # [0,0,0, 1,1,1, ..., 9,9,9]
 
         if self.init == 'real':
             print('initialize synthetic data from random real images')
@@ -96,7 +98,7 @@ class Distiller():
                     print('-------------------------\nEvaluation\nmodel_train = %s, model_eval = %s, iteration = %d'%(self.model, model_eval, it))
                     self.epoch_eval_train = 300
 
-                    self.dc_aug_param = get_daparam(self.dataset, self.model, model_eval, self.ipc)
+                    self.dc_aug_param = get_daparam(dataset, self.model, model_eval, self.ipc)
                     print('DC augmentation parameters: \n', self.dc_aug_param)
                     
                     accs = []
@@ -105,12 +107,12 @@ class Distiller():
                         net_eval = get_network(model_eval,channel,num_classes, im_size).to(self.device)
                         image_syn_eval, label_syn_eval = copy.deepcopy(image_syn.detach()), copy.deepcopy(label_syn.detach()) 
 
-                    _, acc_train, acc_test = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args)
+                    _, acc_train, acc_test = custom_evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, self.lr_net,self.device,self.epoch_eval_train,self.batch_train,self.dc_aug_param)
                     accs.append(acc_test)
                     print('Evaluate %d random %s, mean = %.4f std = %.4f\n-------------------------'%(len(accs), model_eval, np.mean(accs), np.std(accs)))
 
                 ''' visualize and save '''
-                save_name = os.path.join(save_path, 'vis_%s_%s_%s_%dipc_iter%d.png'%(self.method, dataset, self.model, self.ipc,  it))
+                save_name = os.path.join(save_path, 'vis_DS_%s_%s_%dipc_iter%d.png'%( dataset, self.model, self.ipc,  it))
                 image_syn_vis = copy.deepcopy(image_syn.detach().cpu())
                 for ch in range(channel):
                     image_syn_vis[:, ch] = image_syn_vis[:, ch]  * std[ch] + mean[ch]
@@ -118,8 +120,8 @@ class Distiller():
                 image_syn_vis[image_syn_vis>1] = 1.0
                 save_image(image_syn_vis, save_name, nrow=self.ipc) # Trying normalize = True/False may get better visual effects.
 
-                    # if it == self.iteration: # record the final results
-                    #     accs_all_exps[model_eval] += accs
+                if it == self.iteration: # record the final results
+                    accs_all_exps[model_eval] += accs
 
             ''' Train synthetic data '''
             net = get_network(self.model, channel, num_classes, im_size).to(self.device) # get a random model
@@ -158,11 +160,6 @@ class Distiller():
                     img_syn = image_syn[c*self.ipc:(c+1)*self.ipc].reshape((self.ipc, channel, im_size[0], im_size[1]))
                     lab_syn = torch.ones((self.ipc,), device=self.device, dtype=torch.long) * c
 
-                    # if args.dsa:
-                    #     seed = int(time.time() * 1000) % 100000
-                    #     img_real = DiffAugment(img_real, args.dsa_strategy, seed=seed, param=args.dsa_param)
-                    #     img_syn = DiffAugment(img_syn, args.dsa_strategy, seed=seed, param=args.dsa_param)
-
                     output_real = net(img_real)
                     loss_real = criterion(output_real, lab_real)
                     gw_real = torch.autograd.grad(loss_real, net_parameters)
@@ -198,8 +195,8 @@ class Distiller():
 
             if it == self.iteration: # only record the final results
                 data_save.append([copy.deepcopy(image_syn.detach().cpu()), copy.deepcopy(label_syn.detach().cpu())])
-                torch.save({'data': data_save }, os.path.join(save_path, 'res_%s_%s_%s_%dipc.pt'%(self.method, dataset, self.model, self.ipc)))
-            return data_save
+                torch.save({'data': data_save }, os.path.join(save_path, 'res_DS_%s_%s_%dipc.pt'%( dataset, self.model, self.ipc)))
+        return data_save
 x = Distiller()
 
 x.distill()
